@@ -1,5 +1,7 @@
 # Bastion — FortiGuard Labs for the Omarchy bar
 
+![Bastion panel open under the bar, with the radar red for an unread outbreak alert](preview.png)
+
 A radar next to the clock that keeps FortiGuard Labs one click away. It turns
 Fortinet red while an Outbreak Alert or a critical PSIRT advisory is unread, and stays
 bar-coloured otherwise; hover it for unread counts per feed. The sweep turns while a
