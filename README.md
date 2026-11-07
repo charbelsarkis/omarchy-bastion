@@ -11,8 +11,23 @@ refresh runs (not with animations off).
 omarchy plugin add https://github.com/charbelsarkis/omarchy-bastion.git --enable
 ```
 
-Update later with `omarchy plugin update charbel.bastion`. Needs `python3` (feeds are
-fetched by the bundled `bastion.py`, standard library only).
+Update later with `omarchy plugin update charbel.bastion`.
+
+## Remove
+
+```
+omarchy plugin remove charbel.bastion
+rm -rf ~/.cache/omarchy-bastion ~/.local/state/omarchy-bastion   # optional: cached feeds and read state
+```
+
+## Dependencies
+
+- `python3` (standard library only): the bundled `bastion.py` fetches and sanitizes the feeds.
+- Omarchy's own `omarchy-launch-browser` and `omarchy-notification-send`, which ship with Omarchy.
+- Network: three fixed HTTPS RSS feeds on fortiguard.com, see [Network](#network). No other
+  services, no sudo, and nothing outside `~/.cache/omarchy-bastion` and
+  `~/.local/state/omarchy-bastion` is written (plus the plugin's own entry in
+  `~/.config/omarchy/shell.json` when you change its settings).
 
 ## Features
 
