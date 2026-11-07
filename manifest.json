@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "id": "charbel.bastion",
+  "name": "Bastion",
+  "version": "1.3.1",
+  "author": "charbel",
+  "license": "MIT",
+  "description": "FortiGuard Labs companion: Fortinet PSIRT advisories, Outbreak Alerts, Threat Signals and a FortiGuard lookup box in the Omarchy bar. Not affiliated with Fortinet.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Bastion (FortiGuard)",
+    "description": "FortiGuard PSIRT advisories, Outbreak Alerts, Threat Signals and lookup.",
+    "category": "Security",
+    "allowMultiple": false,
+    "defaultSection": "centerEnd",
+    "defaults": {
+      "backgroundRefresh": true,
+      "refreshIntervalMin": 60,
+      "notify": true,
+      "notifyPsirt": "high",
+      "notifyOutbreaks": true,
+      "notifyThreatSignals": true
+    },
+    "schema": [
+      {
+        "key": "backgroundRefresh",
+        "type": "boolean",
+        "label": "Refresh FortiGuard feeds in the background",
+        "defaultValue": true
+      },
+      {
+        "key": "refreshIntervalMin",
+        "type": "integer",
+        "label": "Background refresh interval (minutes)",
+        "min": 15,
+        "max": 1440,
+        "step": 15,
+        "defaultValue": 60
+      },
+      {
+        "key": "notify",
+        "type": "boolean",
+        "label": "Desktop notifications for new FortiGuard alerts",
+        "defaultValue": true
+      },
+      {
+        "key": "notifyPsirt",
+        "type": "enum",
+        "label": "Notify for PSIRT advisories at or above",
+        "options": [
+          "off",
+          "critical",
+          "high",
+          "medium",
+          "all"
+        ],
+        "defaultValue": "high",
+        "description": "CVSS severity: critical 9.0+, high 7.0+, medium 4.0+."
+      },
+      {
+        "key": "notifyOutbreaks",
+        "type": "boolean",
+        "label": "Notify for new Outbreak Alerts",
+        "defaultValue": true
+      },
+      {
+        "key": "notifyThreatSignals",
+        "type": "boolean",
+        "label": "Notify for new Threat Signals",
+        "defaultValue": true
+      }
+    ]
+  }
+}

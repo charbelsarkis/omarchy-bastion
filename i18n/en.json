@@ -1,0 +1,71 @@
+{
+  "title": "FortiGuard",
+  "refresh": "Refresh now (R)",
+  "autoOn": "Background refresh every %1 min · click to turn off",
+  "autoOff": "Background refresh off · click to refresh every hour",
+  "lookup.title": "FortiGuard lookup",
+  "lookup.placeholder": "CVE, FG-IR id, IP, domain, URL, hash…",
+  "lookup.hint": "Press Enter to open the result on fortiguard.com · / to focus",
+  "lookup.kind.cve": "CVE → FortiGuard search (IPS signatures, outbreak coverage)",
+  "lookup.kind.psirt": "FG-IR id → Fortinet PSIRT advisory",
+  "lookup.kind.ip": "IP address → FortiGuard IP lookup",
+  "lookup.kind.hash": "File hash → FortiGuard IOC lookup",
+  "lookup.kind.url": "Domain / URL → FortiGuard web filter category + Secure DNS",
+  "lookup.kind.keyword": "Keyword → FortiGuard search",
+  "lookup.kind.invalid": "Not a valid lookup",
+  "psirt.title": "PSIRT advisories",
+  "outbreak.title": "Outbreak alerts",
+  "threat.title": "Threat signals",
+  "unread": {
+    "one": "%1 new",
+    "other": "%1 new"
+  },
+  "empty": "Nothing here yet",
+  "severity.critical": "CRITICAL",
+  "severity.high": "HIGH",
+  "severity.medium": "MEDIUM",
+  "severity.low": "LOW",
+  "severity.info": "INFO",
+  "status.refreshing": "Refreshing…",
+  "status.never": "Not fetched yet",
+  "status.offline": "Feeds unavailable",
+  "status.updated": "Updated %1",
+  "status.partial": "%1 · some feeds failed",
+  "status.feedError": "Some FortiGuard feeds could not be reached; showing the last saved copy.",
+  "age.minutes": {
+    "one": "%1 min ago",
+    "other": "%1 min ago"
+  },
+  "age.hours": {
+    "one": "%1 hour ago",
+    "other": "%1 hours ago"
+  },
+  "age.days": {
+    "one": "%1 day ago",
+    "other": "%1 days ago"
+  },
+  "footer": "Data: FortiGuard Labs public RSS feeds · Bastion is not affiliated with or endorsed by Fortinet, Inc.",
+  "notify.psirtCritical": "Critical Fortinet PSIRT advisory",
+  "notify.psirt": "New Fortinet PSIRT advisory",
+  "notify.outbreak": "FortiGuard Outbreak Alert",
+  "notify.threat": "FortiGuard Threat Signal",
+  "notify.more": {
+    "one": "%1 more FortiGuard alert",
+    "other": "%1 more FortiGuard alerts"
+  },
+  "notify.moreBody": "Click to open Bastion",
+  "tooltip.title": "FortiGuard",
+  "tooltip.quiet": "FortiGuard · nothing new",
+  "tooltip.outbreak": {
+    "one": "%1 outbreak alert",
+    "other": "%1 outbreak alerts"
+  },
+  "tooltip.threat": {
+    "one": "%1 threat signal",
+    "other": "%1 threat signals"
+  },
+  "tooltip.psirt": {
+    "one": "%1 PSIRT advisory",
+    "other": "%1 PSIRT advisories"
+  }
+}
