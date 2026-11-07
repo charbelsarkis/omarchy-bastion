@@ -27,7 +27,7 @@ rm -rf ~/.cache/omarchy-bastion ~/.local/state/omarchy-bastion   # optional: cac
 - `python3` (standard library only): the bundled `bastion.py` fetches and sanitizes the feeds.
 - Omarchy's own `omarchy-launch-browser` and `omarchy-notification-send`, which ship with Omarchy.
 - Network: three fixed HTTPS RSS feeds on fortiguard.com, see [Network](#network). No other
-  services, no sudo, and nothing outside `~/.cache/omarchy-bastion` and
+  services; it runs entirely as your user, and nothing outside `~/.cache/omarchy-bastion` and
   `~/.local/state/omarchy-bastion` is written (plus the plugin's own entry in
   `~/.config/omarchy/shell.json` when you change its settings).
 
