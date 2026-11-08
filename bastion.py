@@ -187,9 +187,15 @@ def parse_feed(kind, data):
 
 class FortinetOnlyRedirects(urllib.request.HTTPRedirectHandler):
     """Follow a redirect only to HTTPS on a Fortinet host (the feeds 302 to
-    filestore.fortinet.com); refuse anything else before connecting to it."""
+    filestore.fortinet.com); refuse anything else before connecting to it.
+
+    The redirect response's body is never read: the stock handler calls an
+    unbounded fp.read() before following, which would bypass MAX_BYTES, so
+    the response is closed here first and that read returns nothing."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if fp is not None:
+            fp.close()
         if not safe_link(newurl):
             raise urllib.error.HTTPError(req.full_url, code, "redirect off Fortinet HTTPS refused", headers, fp)
         return super().redirect_request(req, fp, code, msg, headers, newurl)

@@ -183,6 +183,72 @@ class RedirectTests(unittest.TestCase):
         ok = handler.redirect_request(req, None, 302, "Found", {}, "https://filestore.fortinet.com/fortiguard/rss/ir.xml")
         self.assertEqual(ok.full_url, "https://filestore.fortinet.com/fortiguard/rss/ir.xml")
 
+    def _redirect_response(self, location, body_size):
+        """A real http.client response to a 302 whose body is body_size bytes,
+        served lazily; returns (response, function giving bytes consumed)."""
+        import http.client
+        import io
+
+        head = ("HTTP/1.1 302 Found\r\nLocation: %s\r\nContent-Length: %d\r\n\r\n" % (location, body_size)).encode()
+
+        class Body(io.RawIOBase):
+            def __init__(self):
+                self.pos = 0
+
+            def readable(self):
+                return True
+
+            def readinto(self, buf):
+                total = len(head) + body_size
+                n = min(len(buf), total - self.pos)
+                for i in range(n):
+                    p = self.pos + i
+                    buf[i] = head[p] if p < len(head) else 0x41
+                self.pos += n
+                return n
+
+        raw = Body()
+
+        class Sock:
+            def makefile(self, mode):
+                return io.BufferedReader(raw)
+
+        resp = http.client.HTTPResponse(Sock())
+        resp.begin()
+        return resp, lambda: raw.pos - len(head)
+
+    def test_redirect_body_is_not_buffered(self):
+        import urllib.error
+        import urllib.request
+        big = 64 * bastion.MAX_BYTES
+        targets = (
+            ("https://filestore.fortinet.com/fortiguard/rss/ir.xml", None),
+            ("https://evil.example/ir.xml", urllib.error.HTTPError),
+        )
+        for target, raises in targets:
+            handler = bastion.FortinetOnlyRedirects()
+            followed = []
+
+            class Parent:
+                def open(self, new, timeout=None):
+                    followed.append(new.full_url)
+                    return "followed"
+
+            handler.parent = Parent()
+            req = urllib.request.Request(bastion.FEEDS["psirt"])
+            req.timeout = bastion.TIMEOUT  # set by OpenerDirector.open in real use
+            resp, consumed = self._redirect_response(target, big)
+            if raises:
+                with self.assertRaises(raises) as caught:
+                    handler.http_error_302(req, resp, 302, "Found", resp.msg)
+                caught.exception.close()
+                self.assertEqual(followed, [])
+            else:
+                self.assertEqual(handler.http_error_302(req, resp, 302, "Found", resp.msg), "followed")
+                self.assertEqual(followed, [target])
+            # Only header parsing's buffered read-ahead may be consumed, never the body.
+            self.assertLess(consumed(), bastion.MAX_BYTES, target)
+
 
 if __name__ == "__main__":
     unittest.main()
