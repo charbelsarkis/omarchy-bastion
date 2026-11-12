@@ -162,7 +162,8 @@ class StateTests(unittest.TestCase):
         bastion.COALESCE_SEC = 0  # tests fetch back to back on purpose
         self.feeds = {}    # kind -> bytes, or missing for "offline"
         self.broken = set()  # URLs that fail even when the feed is up
-        self.slow = {}     # kind -> seconds to stall
+        self.stall = {}    # kind -> callable run inside that feed's download
+        self.release = threading.Event()  # set in tearDown: frees stalled downloads
         self.calls = []    # (url, validators)
         lock = threading.Lock()
 
@@ -170,8 +171,8 @@ class StateTests(unittest.TestCase):
             with lock:
                 self.calls.append((url, dict(validators or {})))
             kind = next(k for k, u in bastion.FEEDS.items() if url in (u, FILESTORE % k))
-            if kind in self.slow:
-                time.sleep(self.slow[kind])
+            if kind in self.stall:
+                self.stall[kind]()
             if kind not in self.feeds or url in self.broken:
                 raise OSError("offline")
             data = self.feeds[kind]
@@ -182,6 +183,7 @@ class StateTests(unittest.TestCase):
         bastion.download = fake_download
 
     def tearDown(self):
+        self.release.set()
         bastion.CACHE_FILE, bastion.STATE_FILE, bastion.download, bastion.COALESCE_SEC, bastion.FETCH_DEADLINE = self.saved
         self.tmp.cleanup()
 
@@ -303,21 +305,35 @@ class StateTests(unittest.TestCase):
         self.assertEqual([u for u, _ in self.calls if u in (bastion.FEEDS["psirt"], FILESTORE % "psirt")], [FILESTORE % "psirt", bastion.FEEDS["psirt"]])
 
     def test_feeds_are_fetched_in_parallel_with_a_deadline(self):
+        # No tight wall-clock margins to race: a hung feed blocks until
+        # tearDown (or 20 s), and parallelism is proven by a rendezvous rather
+        # than by elapsed time.
         self.all_up()
-        bastion.FETCH_DEADLINE = 0.5
-        self.slow = {"threat": 3}
+        bastion.FETCH_DEADLINE = 1
+        self.stall = {"threat": lambda: self.release.wait(20)}   # hangs well past the deadline
         started = time.monotonic()
         result = self.fetch()
-        self.assertLess(time.monotonic() - started, 2)
+        self.assertLess(time.monotonic() - started, 10)   # gave up; didn't wait for the hung feed
         self.assertEqual(list(result["errors"]), ["threat"])
         self.assertIn("TimeoutError", result["errors"]["threat"])
         self.assertEqual([i["id"] for i in result["psirt"]], ["p1", "p2"])
 
-        self.slow = {"psirt": 0.3, "outbreak": 0.3, "threat": 0.3}
-        bastion.FETCH_DEADLINE = 5
-        started = time.monotonic()
+        # Each feed's first download waits until all three are in flight at
+        # once. Fetched one after another, the first wait times out and that
+        # feed errors. One-shot, so a fallback second download passes through.
+        arrived, everyone, count = set(), threading.Event(), threading.Lock()
+
+        def meet(kind):
+            with count:
+                arrived.add(kind)
+                if len(arrived) == len(bastion.FEEDS):
+                    everyone.set()
+            if not everyone.wait(5):
+                raise OSError("feeds were not fetched in parallel")
+
+        self.stall = {kind: (lambda k=kind: meet(k)) for kind in bastion.FEEDS}
+        bastion.FETCH_DEADLINE = 10
         self.assertEqual(self.fetch()["errors"], {})
-        self.assertLess(time.monotonic() - started, 0.8)   # three 0.3 s feeds at once, not 0.9 s in a row
 
     def test_back_to_back_fetches_coalesce(self):
         self.all_up()
