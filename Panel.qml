@@ -48,15 +48,29 @@ Panel {
   // Helper jobs waiting for the running one: [{ command, args }], one per command.
   property var pendingJobs: []
   property real nowSec: Date.now() / 1000
+  // Wall-clock second of the last fetch this copy started (see Model.refreshDue).
+  property real lastAttemptSec: 0
+
+  // Every monitor's bar builds its own copy of this widget. Only the copy that
+  // answers IPC refreshes in the background; the others follow the shared
+  // state file (stateWatch), so reading alerts on one screen clears them on all.
+  readonly property bool leader: ipc.enabled
+  readonly property string stateFile: {
+    var base = String(Quickshell.env("XDG_STATE_HOME") || "")
+    if (base === "") base = String(Quickshell.env("HOME") || "") + "/.local/state"
+    return base + "/omarchy-bastion/state.json"
+  }
 
   // Keyboard cursor over the flattened rows, in panel order: outbreak, threat,
   // then PSIRT (Fortinet-specific, so it sits last).
   property bool cursorActive: false
   property int cursorIndex: 0
 
-  readonly property var psirtRows: feed.psirt.slice(0, 8)
-  readonly property var outbreakRows: feed.outbreak.slice(0, 5)
-  readonly property var threatRows: feed.threat.slice(0, 5)
+  // Every held item is listed (Model.FEED_LIMITS), so closing the panel acks
+  // only rows that were on screen.
+  readonly property var psirtRows: feed.psirt
+  readonly property var outbreakRows: feed.outbreak
+  readonly property var threatRows: feed.threat
   readonly property int rowCount: psirtRows.length + outbreakRows.length + threatRows.length
   readonly property bool hasErrors: Object.keys(feed.errors).length > 0
   // Something urgent is unread: an outbreak alert or a critical PSIRT advisory.
@@ -91,7 +105,8 @@ Panel {
     helperProc.running = true
   }
 
-  // Ids of every item the panel holds right now, for acking on close.
+  // Ids of every item the panel lists right now (it lists all it holds), for
+  // acking on close.
   function shownIds() {
     var ids = []
     var kinds = ["psirt", "outbreak", "threat"]
@@ -100,7 +115,16 @@ Panel {
     return ids
   }
 
-  function refresh() { runHelper("fetch") }
+  function refresh() {
+    bastion.lastAttemptSec = Date.now() / 1000
+    runHelper("fetch")
+  }
+
+  function maybeRefresh() {
+    if (Model.refreshDue(Date.now() / 1000, feed.fetchedAt, bastion.hasErrors, bastion.lastAttemptSec,
+        bastion.refreshIntervalMin * 60))
+      refresh()
+  }
 
   function handleOutput(text, wasFetch) {
     var parsed = null
@@ -211,6 +235,8 @@ Panel {
     if (bastion.fetching) return strings.t("status.refreshing")
     if (feed.fetchedAt <= 0) return bastion.hasErrors ? strings.t("status.offline") : strings.t("status.never")
     var updated = strings.t("status.updated").arg(ageText(feed.fetchedAt))
+    // Every feed failed: the data is as old as fetchedAt says, so say so.
+    if (Object.keys(feed.errors).length >= 3) return strings.t("status.offlineSince").arg(updated)
     return bastion.hasErrors ? strings.t("status.partial").arg(updated) : updated
   }
 
@@ -310,22 +336,40 @@ Panel {
     }
   }
 
-  // Hourly (configurable) background refresh; switchable from the panel.
+  // A helper run never needs this long (bastion.py gives up on the network
+  // after 45 s); stop a stuck one so the jobs queued behind it can run.
   Timer {
-    id: backgroundTimer
-    interval: bastion.refreshIntervalMin * 60 * 1000
-    repeat: true
-    running: bastion.backgroundRefresh
-    triggeredOnStart: false
-    onTriggered: bastion.refresh()
+    interval: 90000
+    running: helperProc.running
+    onTriggered: helperProc.running = false
   }
 
-  // On startup, catch up if the cache is older than one interval.
+  // Background refresh (hourly by default; switchable from the panel). A
+  // one-minute wall-clock check instead of one timer per interval: Qt timers
+  // stop counting during suspend, so an hourly timer could fire up to an hour
+  // after resume. The check also retries failed feeds (Model.refreshDue).
+  Timer {
+    interval: 60000
+    repeat: true
+    running: bastion.backgroundRefresh && bastion.leader
+    onTriggered: bastion.maybeRefresh()
+  }
+
+  // First check shortly after startup, once the cached result has loaded.
   Timer {
     interval: 8000
-    running: bastion.backgroundRefresh
+    running: bastion.backgroundRefresh && bastion.leader
     repeat: false
-    onTriggered: if (bastion.staleFor(bastion.refreshIntervalMin * 60)) bastion.refresh()
+    onTriggered: bastion.maybeRefresh()
+  }
+
+  // Another copy of the widget (other monitor) fetched or acked: reload.
+  FileView {
+    id: stateWatch
+    path: bastion.stateFile
+    watchChanges: true
+    printErrors: false
+    onFileChanged: bastion.runHelper("cached")
   }
 
   Timer {
@@ -336,6 +380,7 @@ Panel {
   }
 
   ShellIpc {
+    id: ipc
     target: bastion.ipcTarget
     function open(): void { bastion.open() }
     function close(): void { bastion.close() }
@@ -368,7 +413,8 @@ Panel {
     function lookupUrl(query: string): string { return Model.lookupUrl(query) }
     function status(): string {
       return JSON.stringify({ unreadCritical: bastion.feed.unreadCritical, unreadTotal: bastion.feed.unreadTotal,
-        fetchedAt: bastion.feed.fetchedAt, backgroundRefresh: bastion.backgroundRefresh, errors: bastion.feed.errors })
+        fetchedAt: bastion.feed.fetchedAt, backgroundRefresh: bastion.backgroundRefresh, errors: bastion.feed.errors,
+        leader: bastion.leader })
     }
   }
 

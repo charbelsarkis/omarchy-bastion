@@ -34,13 +34,15 @@ rm -rf ~/.cache/omarchy-bastion ~/.local/state/omarchy-bastion   # optional: cac
 ## Features
 
 - **Outbreak Alerts** and **Threat Signals**: FortiGuard Labs headlines.
-- **PSIRT advisories**: the latest Fortinet product security advisories with CVSS
-  score, severity and the affected products (FortiOS, FortiSIEM, …).
+- **PSIRT advisories**: the latest 15 Fortinet product security advisories (enough for
+  a monthly batch) with CVSS score, severity and the affected products (FortiOS,
+  FortiSIEM, …).
 - **FortiGuard lookup**: type a CVE, FG-IR id, IP, domain/URL, file hash or keyword
   and press Enter to open the matching fortiguard.com page in your browser.
 
-The panel lists Outbreak Alerts, then Threat Signals, then the Fortinet-specific PSIRT
-advisories. Click a row to open it. Keys: `/` focuses lookup, `↑/↓` move, `Enter` opens,
+The panel lists the latest five Outbreak Alerts, then five Threat Signals, then the
+Fortinet-specific PSIRT advisories. Closing it marks what it listed as read. Click a row
+to open it. Keys: `/` focuses lookup, `↑/↓` move, `Enter` opens,
 `R` refreshes, `Esc` closes. Right- or middle-click the radar to refresh.
 
 ## Notifications
@@ -51,7 +53,8 @@ Clicking a notification opens that advisory or alert on FortiGuard.
 - PSIRT advisories at or above the threshold (default **high**, CVSS 7.0+). Critical
   ones use critical urgency.
 - New Outbreak Alerts and Threat Signals.
-- At most three individual notifications per refresh, most severe first; the rest are
+- At most three individual notifications per refresh, most severe first (critical
+  advisory, outbreak alert, high advisory, threat signal, then the rest); the others are
   rolled into one "N more FortiGuard alerts" notification that opens the panel.
 - A feed's first successful fetch never notifies, so you don't get the whole backlog at
   once, even if the very first fetch ran offline or with a feed down.
@@ -62,18 +65,32 @@ To preview them: `omarchy-shell charbel.bastion testNotifications`.
 
 ## Network
 
-Fetches only three fixed HTTPS RSS feeds on fortiguard.com (15s timeout, 2 MiB cap;
-redirects are followed only to HTTPS Fortinet hosts),
-hourly in the background. Switch background refresh off with the toggle in the panel
-header; it then refreshes only when you open the panel (if older than 15 min) or press
-refresh. Lookups never touch the network from the shell; they open your browser.
+Fetches only three fixed HTTPS RSS feeds on fortiguard.com, hourly in the background,
+in parallel: 15 s timeout per network operation, 45 s for the whole refresh, 2 MiB cap
+per feed. Redirects are followed only to HTTPS Fortinet hosts; the host a feed redirects
+to (filestore.fortinet.com) is remembered and asked directly next time, falling back to
+fortiguard.com if that fails. Requests are conditional (`ETag`/`Last-Modified`), so an
+unchanged feed costs a 304 and no download.
+
+If some feeds fail, Bastion keeps showing their last copy and retries every 10 minutes
+instead of waiting for the next hourly refresh. Refreshes are scheduled by wall-clock
+time, so one that came due while the laptop slept runs within a minute of waking.
+
+Switch background refresh off with the toggle in the panel header; it then refreshes only
+when you open the panel (if older than 15 min) or press refresh. Lookups never touch the
+network from the shell; they open your browser.
+
+With several monitors every bar has its own copy of the widget. Only one of them
+refreshes in the background, and they share read state: reading alerts on one screen
+clears them on all.
 
 Settings (`~/.config/omarchy/shell.json`, entry `charbel.bastion`):
 `backgroundRefresh` (true), `refreshIntervalMin` (60), `notify` (true),
 `notifyPsirt` (`off`/`critical`/`high`/`medium`/`all`, default `high`), `notifyOutbreaks` (true),
 `notifyThreatSignals` (true).
 
-Cache: `~/.cache/omarchy-bastion/feeds.json`. Read state: `~/.local/state/omarchy-bastion/state.json`.
+Cache: `~/.cache/omarchy-bastion/feeds.json`. Read state: `~/.local/state/omarchy-bastion/state.json`
+(plus a `.lock` file beside it).
 
 ## IPC
 

@@ -87,6 +87,10 @@ function ageParts(ts, nowSec) {
   return { unit: "days", value: Math.floor(delta / 86400) }
 }
 
+// Items held per feed (bastion.py MAX_ITEMS). The panel lists all of them, so
+// acking what it holds acks exactly what it showed.
+var FEED_LIMITS = { psirt: 15, outbreak: 5, threat: 5 }
+
 // Coerce helper output into the shape the panel expects, dropping anything
 // unexpected. Defends against a corrupted cache file.
 function sanitizeResult(obj) {
@@ -98,9 +102,8 @@ function sanitizeResult(obj) {
   if (obj.errors && typeof obj.errors === "object") {
     for (var k in obj.errors) if (k === "psirt" || k === "outbreak" || k === "threat") out.errors[k] = str(obj.errors[k], 160)
   }
-  var limits = { psirt: 15, outbreak: 8, threat: 8 }
-  for (var kind in limits) {
-    var list = Array.isArray(obj[kind]) ? obj[kind].slice(0, limits[kind]) : []
+  for (var kind in FEED_LIMITS) {
+    var list = Array.isArray(obj[kind]) ? obj[kind].slice(0, FEED_LIMITS[kind]) : []
     out[kind] = list.map(function(it) { return sanitizeItem(it) }).filter(function(it) { return it.title !== "" })
   }
   out.fresh = (Array.isArray(obj.fresh) ? obj.fresh : []).slice(0, 20).map(function(it) {
@@ -182,8 +185,11 @@ function notificationsFor(fresh, prefs) {
     if (it.kind === "threat") return prefs.threats !== false
     return false
   })
+  // Critical advisory > outbreak alert > high advisory > threat signal > the
+  // rest: a high-severity Fortinet advisory must not drop into the "+N more"
+  // summary behind generic threat signals.
   function weight(it) {
-    if (it.kind === "psirt") return it.severity === "critical" ? 10 : severityRank(it.severity)
+    if (it.kind === "psirt") return { critical: 10, high: 7 }[it.severity] || severityRank(it.severity)
     return it.kind === "outbreak" ? 9 : 5
   }
   picked.sort(function(a, b) { return weight(b) - weight(a) || (b.published || 0) - (a.published || 0) })
@@ -203,8 +209,24 @@ function notificationsFor(fresh, prefs) {
   return { single: single, overflow: Math.max(0, picked.length - single.length) }
 }
 
+// After a failed or recent attempt, wait this long before trying again.
+var RETRY_SEC = 600
+
+// Whether a background refresh is due. Works on wall-clock seconds, so a
+// suspend that froze the Qt timers is noticed on the next tick after resume.
+// Due when the data is older than the interval, or when the last fetch had
+// errors, but never within RETRY_SEC of the last attempt (a clock that went
+// backwards doesn't block refreshes).
+function refreshDue(nowSec, fetchedAt, hasErrors, lastAttemptSec, intervalSec) {
+  var since = nowSec - (lastAttemptSec || 0)
+  if (since >= 0 && since < RETRY_SEC) return false
+  if (!(fetchedAt > 0) || hasErrors) return true
+  return nowSec - fetchedAt >= intervalSec
+}
+
 if (typeof module !== "undefined") {
   module.exports = { classify: classify, lookupUrl: lookupUrl, safeFeedLink: safeFeedLink, sanitizeResult: sanitizeResult,
     ageParts: ageParts, severityRank: severityRank, notificationText: notificationText, normalizeQuery: normalizeQuery,
-    notificationsFor: notificationsFor, normalizeNotifyLevel: normalizeNotifyLevel, compactList: compactList }
+    notificationsFor: notificationsFor, normalizeNotifyLevel: normalizeNotifyLevel, compactList: compactList,
+    refreshDue: refreshDue, RETRY_SEC: RETRY_SEC, FEED_LIMITS: FEED_LIMITS }
 }

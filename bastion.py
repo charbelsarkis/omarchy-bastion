@@ -6,22 +6,32 @@ Usage:
   bastion.py cached    Print the last cached result (no network).
   bastion.py ack [id...]  Mark cached items read (all, or just these), print JSON.
 
-Network access is limited to the three fixed HTTPS feed URLs below, with a
-timeout and a hard size cap. Everything taken from a feed is treated as
-untrusted: HTML is stripped, strings are length-bounded, links must stay on
-fortinet.com over HTTPS, and item counts are capped. Output is plain JSON on
-stdout; the QML side renders it with Text.PlainText only.
+Network access is limited to the three fixed HTTPS feed URLs below and the
+HTTPS Fortinet hosts they redirect to. The feeds are fetched in parallel, with
+a per-operation timeout, an overall deadline and a hard size cap, and with
+conditional requests so an unchanged feed costs a 304. Everything taken from
+a feed is treated as untrusted: HTML is stripped, strings are length-bounded,
+links must stay on fortinet.com over HTTPS, and item counts are capped. Output
+is plain JSON on stdout; the QML side renders it with Text.PlainText only.
+
+Every monitor's bar runs its own copy of the widget, so several helpers can
+run at once: state changes are serialized with a lock file, and a fetch that
+lands right after another one reuses its result instead of downloading again.
 
 Not affiliated with or endorsed by Fortinet, Inc.
 """
 
+import contextlib
 import email.utils
+import fcntl
 import html
+import io
 import json
 import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -34,8 +44,13 @@ FEEDS = {
     "threat": "https://www.fortiguard.com/rss/threatsignal.xml",
 }
 MAX_BYTES = 2 * 1024 * 1024
-TIMEOUT = 15
-MAX_ITEMS = {"psirt": 15, "outbreak": 8, "threat": 8}
+TIMEOUT = 15          # seconds, per socket operation
+FETCH_DEADLINE = 45   # seconds, for the whole fetch (all feeds, in parallel)
+COALESCE_SEC = 60     # a fetch this soon after a clean one reuses its result
+CACHE_FORMAT = 2      # bump when parse_feed's output changes: old items are then never reused on a 304
+# Everything held is listed in the panel, so closing it acks only what was shown.
+# PSIRT keeps 15: Fortinet publishes its advisories in monthly batches.
+MAX_ITEMS = {"psirt": 15, "outbreak": 5, "threat": 5}
 MAX_TITLE = 160
 MAX_SUMMARY = 280
 MAX_CVES = 8
@@ -43,7 +58,6 @@ MAX_KNOWN = 2000
 MAX_FRESH = 20
 MAX_PRODUCTS = 4
 MAX_ACK_IDS = 100
-USER_AGENT = "Bastion-Omarchy-Plugin/1.0 (+FortiGuard RSS reader)"
 ALLOWED_HOST_SUFFIX = ".fortinet.com"
 ALLOWED_HOSTS = {"fortinet.com", "fortiguard.com", "www.fortiguard.com"}
 
@@ -56,6 +70,24 @@ PRODUCT_RE = re.compile(r"\bForti(?!Guard\b)[A-Z][A-Za-z0-9]{0,24}(?:-[A-Z0-9][A
 TAG_RE = re.compile(r"<[^>]*>")
 SPACE_RE = re.compile(r"\s+")
 CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f‪-‮⁦-⁩]")
+# ETag / Last-Modified values we store and send back: printable ASCII only.
+HEADER_VALUE_RE = re.compile(r"[\x20-\x7e]{1,200}")
+
+
+def _plugin_version():
+    """The manifest's version, so the User-Agent can't drift from it."""
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manifest.json")
+        with open(path, "r", encoding="utf-8") as handle:
+            version = json.load(handle).get("version")
+    except (OSError, ValueError, AttributeError):
+        return "unknown"
+    if isinstance(version, str) and re.fullmatch(r"[0-9A-Za-z.+-]{1,32}", version):
+        return version
+    return "unknown"
+
+
+USER_AGENT = "Bastion-Omarchy-Plugin/%s (+FortiGuard RSS reader)" % _plugin_version()
 
 
 def _xdg(var, fallback):
@@ -89,10 +121,13 @@ def safe_link(raw):
         return ""
     try:
         parts = urlsplit(link)
+        host = (parts.hostname or "").lower()
+        # .port raises ValueError for a non-numeric or out-of-range port; one
+        # malformed <link> must not take the whole feed down with it.
+        port = parts.port
     except ValueError:
         return ""
-    host = (parts.hostname or "").lower()
-    if parts.scheme != "https" or parts.username or parts.password or parts.port:
+    if parts.scheme != "https" or parts.username or parts.password or port is not None:
         return ""
     if host in ALLOWED_HOSTS or host.endswith(ALLOWED_HOST_SUFFIX):
         return link
@@ -189,30 +224,128 @@ class FortinetOnlyRedirects(urllib.request.HTTPRedirectHandler):
     """Follow a redirect only to HTTPS on a Fortinet host (the feeds 302 to
     filestore.fortinet.com); refuse anything else before connecting to it.
 
-    The redirect response's body is never read: the stock handler calls an
-    unbounded fp.read() before following, which would bypass MAX_BYTES, so
-    the response is closed here first and that read returns nothing."""
+    A redirect response's body is never read. The stock handler reads it with
+    an unbounded fp.read() (which would bypass MAX_BYTES), and some redirects
+    never reach redirect_request at all (a non-web Location, or none), so
+    every 30x handler closes the response on entry and hands the stock code an
+    empty stand-in. Nothing here depends on when, or whether, the stock
+    handler reads its fp."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+    def http_error_302(self, req, fp, code, msg, headers):
         if fp is not None:
             fp.close()
+        return super().http_error_302(req, io.BytesIO(), code, msg, headers)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         if not safe_link(newurl):
-            raise urllib.error.HTTPError(req.full_url, code, "redirect off Fortinet HTTPS refused", headers, fp)
+            raise urllib.error.HTTPError(req.full_url, code, "redirect off Fortinet HTTPS refused", headers, None)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 OPENER = urllib.request.build_opener(FortinetOnlyRedirects)
 
 
-def download(url):
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/xml, text/xml"})
-    with OPENER.open(request, timeout=TIMEOUT) as response:
-        if not safe_link(response.geturl()):
+def header_value(value):
+    """A response validator we're willing to store and send back, or ""."""
+    value = value.strip() if isinstance(value, str) else ""
+    return value if HEADER_VALUE_RE.fullmatch(value) else ""
+
+
+def download(url, validators=None):
+    """GET url. Returns (data, info), where info holds the final URL and the
+    response's validators, or (None, {}) when validators were sent and the
+    server answered 304 Not Modified."""
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/xml, text/xml"}
+    headers.update(validators or {})
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        response = OPENER.open(request, timeout=TIMEOUT)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        if exc.code == 304 and validators:
+            return None, {}
+        raise
+    with response:
+        final = safe_link(response.geturl())
+        if not final:
             raise ValueError("ended up off Fortinet HTTPS")
         data = response.read(MAX_BYTES + 1)
+        info = {
+            "url": final,
+            "etag": header_value(response.headers.get("ETag")),
+            "lastModified": header_value(response.headers.get("Last-Modified")),
+        }
     if len(data) > MAX_BYTES:
         raise ValueError("feed too large")
-    return data
+    return data, info
+
+
+def validators_for(meta):
+    out = {}
+    if header_value(meta.get("etag")):
+        out["If-None-Match"] = header_value(meta.get("etag"))
+    if header_value(meta.get("lastModified")):
+        out["If-Modified-Since"] = header_value(meta.get("lastModified"))
+    return out
+
+
+def fetch_feed(kind, meta, cached):
+    """Download and parse one feed. Returns (items, meta) for the cache.
+
+    Goes straight to the Fortinet host the feed last redirected to (saving the
+    redirect), falling back to the canonical URL if that fails. Sends the last
+    response's validators only while the cached items a 304 would reuse are
+    there, so an unchanged feed costs a 304 and no parsing."""
+    meta = meta if isinstance(meta, dict) else {}
+    canonical = FEEDS[kind]
+    learned = safe_link(meta.get("url")) if isinstance(meta.get("url"), str) else ""
+    validators = validators_for(meta) if cached else {}
+    attempts = [learned, canonical] if learned and learned != canonical else [canonical]
+    error = None
+    for url in attempts:
+        try:
+            data, info = download(url, validators)
+            if data is None:
+                kept = {"url": learned, "etag": header_value(meta.get("etag")),
+                        "lastModified": header_value(meta.get("lastModified"))}
+                return cached[: MAX_ITEMS[kind]], kept
+            return parse_feed(kind, data), info
+        except Exception as exc:  # noqa: BLE001 - try the canonical URL next
+            error = exc
+    raise error
+
+
+def cached_items(previous, kind):
+    """The cached items for a feed, skipping anything malformed."""
+    items = previous.get(kind)
+    if not isinstance(items, list):
+        return []
+    return [i for i in items if isinstance(i, dict) and isinstance(i.get("id"), str) and isinstance(i.get("title"), str)]
+
+
+def fetch_all(previous):
+    """Fetch every feed in parallel. Returns {kind: (items, meta) or exception};
+    a feed still running at FETCH_DEADLINE counts as failed (its daemon thread
+    is abandoned and dies with the process)."""
+    same_format = previous.get("format") == CACHE_FORMAT
+    meta = previous.get("http") if same_format and isinstance(previous.get("http"), dict) else {}
+    done = {}
+
+    def work(kind):
+        try:
+            done[kind] = fetch_feed(kind, meta.get(kind), cached_items(previous, kind) if same_format else [])
+        except Exception as exc:  # noqa: BLE001 - reported per feed
+            done[kind] = exc
+
+    threads = [threading.Thread(target=work, args=(kind,), name="bastion-" + kind, daemon=True) for kind in FEEDS]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + FETCH_DEADLINE
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    return {kind: done.get(kind, TimeoutError("no answer within %ss" % FETCH_DEADLINE)) for kind in FEEDS}
 
 
 def read_json(path, fallback):
@@ -237,6 +370,17 @@ def write_json(path, value):
         except OSError:
             pass
         raise
+
+
+@contextlib.contextmanager
+def state_lock():
+    """Serialize fetches and acks across helper runs (one widget per monitor).
+    The lock goes with the process, so a killed helper never leaves it held."""
+    directory = os.path.dirname(STATE_FILE)
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, ".lock"), "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
 
 
 def load_state():
@@ -279,45 +423,73 @@ def decorate(result, state):
 
 
 def all_ids(result):
-    return [item["id"] for kind in FEEDS for item in result.get(kind, [])]
+    return [item["id"] for kind in FEEDS for item in cached_items(result, kind)]
+
+
+def recently_fetched(previous, now):
+    at = previous.get("fetchedAt")
+    return isinstance(at, int) and not previous.get("errors") and 0 <= now - at < COALESCE_SEC
 
 
 def cmd_fetch():
-    previous = read_json(CACHE_FILE, {})
-    result = {"fetchedAt": int(time.time()), "errors": {}}
-    for kind, url in FEEDS.items():
-        try:
-            result[kind] = parse_feed(kind, download(url))
-        except Exception as exc:  # noqa: BLE001 - report per-feed, keep others
-            result["errors"][kind] = clean_text(type(exc).__name__ + ": " + str(exc), 160)
-            result[kind] = previous.get(kind, []) if isinstance(previous.get(kind), list) else []
-    write_json(CACHE_FILE, {k: v for k, v in result.items()})
+    with state_lock():
+        previous = read_json(CACHE_FILE, {})
+        now = int(time.time())
+        if recently_fetched(previous, now):
+            # Another copy of the widget just fetched: reuse it. Its run
+            # already reported (and notified) whatever was new.
+            result = cmd_cached()
+            result["fresh"] = []
+            return result
 
-    state = load_state()
-    known = list(state["known"] or [])
-    known_set = set(known)
-    acked = list(state["acked"])
-    acked_set = set(acked)
-    seeded = set(state["seeded"])
-    fresh = set()
-    for kind in FEEDS:
-        for item in result.get(kind, []):
-            ident = item["id"]
-            if ident in known_set:
-                continue
-            known.append(ident)
-            known_set.add(ident)
-            if kind in seeded:
-                fresh.add(ident)
-            elif ident not in acked_set:
-                # A feed's first successful fetch is its baseline, not news:
-                # otherwise a first run while offline (or with one feed down)
-                # would announce the whole backlog on the next good fetch.
-                acked.append(ident)
-                acked_set.add(ident)
-        if kind not in result["errors"]:
-            seeded.add(kind)
-    save_state(known, acked, seeded)
+        outcomes = fetch_all(previous)
+        old_meta = previous.get("http") if isinstance(previous.get("http"), dict) else {}
+        result = {"format": CACHE_FORMAT, "fetchedAt": 0, "errors": {}, "http": {}}
+        for kind in FEEDS:
+            outcome = outcomes[kind]
+            if isinstance(outcome, Exception):
+                result["errors"][kind] = clean_text(type(outcome).__name__ + ": " + str(outcome), 160)
+                result[kind] = cached_items(previous, kind)
+                # Keep the validators that belong to the items kept.
+                if isinstance(old_meta.get(kind), dict):
+                    result["http"][kind] = old_meta[kind]
+            else:
+                result[kind], result["http"][kind] = outcome
+        # Only a feed that answered makes the cache newer. A fetch that failed
+        # everywhere keeps the old time, so the panel shows the data as stale
+        # and the next check retries instead of waiting a whole interval.
+        old_at = previous.get("fetchedAt")
+        if len(result["errors"]) < len(FEEDS):
+            result["fetchedAt"] = now
+        elif isinstance(old_at, int) and old_at > 0:
+            result["fetchedAt"] = old_at
+        write_json(CACHE_FILE, result)
+
+        state = load_state()
+        known = list(state["known"] or [])
+        known_set = set(known)
+        acked = list(state["acked"])
+        acked_set = set(acked)
+        seeded = set(state["seeded"])
+        fresh = set()
+        for kind in FEEDS:
+            for item in result.get(kind, []):
+                ident = item["id"]
+                if ident in known_set:
+                    continue
+                known.append(ident)
+                known_set.add(ident)
+                if kind in seeded:
+                    fresh.add(ident)
+                elif ident not in acked_set:
+                    # A feed's first successful fetch is its baseline, not news:
+                    # otherwise a first run while offline (or with one feed down)
+                    # would announce the whole backlog on the next good fetch.
+                    acked.append(ident)
+                    acked_set.add(ident)
+            if kind not in result["errors"]:
+                seeded.add(kind)
+        save_state(known, acked, seeded)
 
     decorate(result, {"known": known[-MAX_KNOWN:], "acked": acked[-MAX_KNOWN:]})
     result["fresh"] = fresh_items(result, fresh)
@@ -349,21 +521,28 @@ def cmd_cached():
     if not result:
         return {"fetchedAt": 0, "errors": {}, "psirt": [], "outbreak": [], "threat": [], "unreadCritical": 0, "unreadTotal": 0}
     result.setdefault("errors", {})
+    for kind in FEEDS:
+        result[kind] = cached_items(result, kind)
     return decorate(result, load_state())
 
 
 def cmd_ack(only=None):
     """Mark cached items read. With ids, only those (the rows the panel was
-    showing), so an item fetched while the panel closed stays unread."""
-    result = read_json(CACHE_FILE, {})
-    state = load_state()
-    cached = all_ids(result) if result else []
-    wanted = set(only or [])
-    targets = [i for i in cached if i in wanted] if only else cached
-    acked_set = set(state["acked"])
-    acked = state["acked"] + [i for i in targets if i not in acked_set]
-    known = state["known"] if state["known"] is not None else list(cached)
-    save_state(known, acked, state["seeded"])
+    showing), so an item fetched while the panel closed stays unread. An empty
+    list acks nothing."""
+    with state_lock():
+        result = read_json(CACHE_FILE, {})
+        state = load_state()
+        cached = all_ids(result) if result else []
+        if only is None:
+            targets = cached
+        else:
+            wanted = set(only)
+            targets = [i for i in cached if i in wanted]
+        acked_set = set(state["acked"])
+        acked = state["acked"] + [i for i in targets if i not in acked_set]
+        known = state["known"] if state["known"] is not None else list(cached)
+        save_state(known, acked, state["seeded"])
     return cmd_cached()
 
 

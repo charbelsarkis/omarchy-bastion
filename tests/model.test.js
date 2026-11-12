@@ -74,8 +74,10 @@ const fresh = [
   { kind: "psirt", title: "High thing", severity: "high", cvss: 7.5, advisory: "FG-IR-26-003", link: "", published: 3 },
 ]
 let plan = M.notificationsFor(fresh, { psirtLevel: "high", outbreaks: true, threats: true })
-assert.deepStrictEqual(plan.single.map(n => n.kind + ":" + n.urgency), ["psirt:critical", "outbreak:normal", "threat:normal"])
-assert.strictEqual(plan.overflow, 1)                      // "High thing"; "Low thing" is below the threshold
+// A high Fortinet advisory outranks a generic threat signal.
+assert.deepStrictEqual(plan.single.map(n => n.title), ["Crit <b>thing</b>", "Outbreak", "High thing"])
+assert.deepStrictEqual(plan.single.map(n => n.kind + ":" + n.urgency), ["psirt:critical", "outbreak:normal", "psirt:normal"])
+assert.strictEqual(plan.overflow, 1)                      // "Signal"; "Low thing" is below the threshold
 assert.strictEqual(plan.single[0].link, "")                // non-Fortinet link is never clickable
 assert.ok(plan.single[0].body.startsWith("FG-IR-26-002 · CVSS 9.8 · "), plan.single[0].body)
 assert.ok(!/[<>]/.test(plan.single[0].body))
@@ -106,5 +108,21 @@ assert.strictEqual(M.compactList(undefined, 2), "")
 assert.strictEqual(M.compactList("FortiOS", 2), "")
 // QML hands nested lists over as array-likes, not real Arrays.
 assert.strictEqual(M.compactList({ length: 2, 0: "FortiOS", 1: "FortiProxy" }, 1), "FortiOS +1")
+
+// Held items: the panel lists all of them.
+const many = n => Array.from({ length: n }, (_, i) => ({ id: "i" + i, title: "t" + i }))
+const held = M.sanitizeResult({ psirt: many(20), outbreak: many(9), threat: many(9) })
+assert.deepStrictEqual([held.psirt.length, held.outbreak.length, held.threat.length], [15, 5, 5])
+
+// Background refresh timing (wall-clock seconds).
+const H = 3600, RETRY = M.RETRY_SEC
+assert.strictEqual(M.refreshDue(10 * H, 0, false, 0, H), true)                  // never fetched
+assert.strictEqual(M.refreshDue(10 * H, 10 * H - 60, false, 0, H), false)       // fresh
+assert.strictEqual(M.refreshDue(10 * H, 9 * H, false, 0, H), true)              // one interval old
+assert.strictEqual(M.refreshDue(10 * H, 2 * H, false, 2 * H, H), true)         // slept through 8 intervals
+assert.strictEqual(M.refreshDue(10 * H, 10 * H - 60, true, 10 * H - RETRY, H), true)       // errors: retry
+assert.strictEqual(M.refreshDue(10 * H, 10 * H - 60, true, 10 * H - RETRY + 1, H), false)  // ...but not too soon
+assert.strictEqual(M.refreshDue(10 * H, 2 * H, false, 10 * H - 30, H), false)  // just tried
+assert.strictEqual(M.refreshDue(10 * H, 2 * H, false, 11 * H, H), true)        // clock went backwards
 
 console.log("model.test.js: all assertions passed")

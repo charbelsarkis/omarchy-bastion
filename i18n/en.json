@@ -31,6 +31,7 @@
   "status.offline": "Feeds unavailable",
   "status.updated": "Updated %1",
   "status.partial": "%1 · some feeds failed",
+  "status.offlineSince": "Feeds unavailable · %1",
   "status.feedError": "Some FortiGuard feeds could not be reached; showing the last saved copy.",
   "age.minutes": {
     "one": "%1 min ago",

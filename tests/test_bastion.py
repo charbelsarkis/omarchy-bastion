@@ -3,7 +3,10 @@ import importlib.util
 import json
 import os
 import sys
+import threading
+import time
 import unittest
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("bastion", os.path.join(HERE, "..", "bastion.py"))
@@ -19,6 +22,8 @@ PSIRT = b"""<?xml version='1.0'?><rss version="2.0"><channel>
 <guid>x2</guid><pubDate>garbage</pubDate></item>
 <item><title>Lookalike host</title><link>https://fortinet.com.evil.example/a</link><description>CVSSv3 Score: 5.0</description>
 <guid>x3</guid><pubDate>Tue, 27 Oct 2026 00:00:00 -0700</pubDate></item>
+<item><title>Bad port</title><link>https://fortiguard.fortinet.com:abc/psirt/FG-IR-26-004</link>
+<guid>x4</guid></item>
 </channel></rss>"""
 
 
@@ -47,6 +52,10 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(self.items["x2"]["link"], "")
         self.assertEqual(self.items["x3"]["link"], "")
 
+    def test_malformed_port_drops_the_link_not_the_feed(self):
+        self.assertEqual(self.items["x4"]["link"], "")
+        self.assertEqual(len(self.items), 4)
+
     def test_bad_dates_become_zero(self):
         self.assertEqual(self.items["x2"]["published"], 0)
 
@@ -74,6 +83,18 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(bastion.safe_link("http://fortiguard.fortinet.com/x"), "")
         self.assertEqual(bastion.safe_link("https://user@fortiguard.fortinet.com/x"), "")
         self.assertEqual(bastion.safe_link("https://evilfortinet.com/x"), "")
+
+    def test_safe_link_ports(self):
+        for link in ("https://www.fortinet.com:abc/x", "https://www.fortinet.com:99999/x",
+                     "https://www.fortinet.com:8443/x", "https://www.fortinet.com:0/x"):
+            self.assertEqual(bastion.safe_link(link), "", link)
+
+
+class VersionTests(unittest.TestCase):
+    def test_user_agent_carries_manifest_version(self):
+        with open(os.path.join(HERE, "..", "manifest.json"), encoding="utf-8") as handle:
+            version = json.load(handle)["version"]
+        self.assertIn("/%s " % version, bastion.USER_AGENT)
 
 
 class FreshTests(unittest.TestCase):
@@ -108,34 +129,57 @@ def rss(*ids):
     return ("<rss><channel>%s</channel></rss>" % items).encode()
 
 
+FILESTORE = "https://filestore.fortinet.com/fortiguard/rss/%s.xml"
+
+
 class StateTests(unittest.TestCase):
-    """cmd_fetch / cmd_ack against a fake network and a temporary state dir."""
+    """cmd_fetch / cmd_ack against a fake network and a temporary state dir.
+
+    The fake serves each feed from its canonical URL and from FILESTORE (where
+    the real feeds redirect to), with an ETag derived from the content, and
+    answers 304 when sent the current one."""
 
     def setUp(self):
         import tempfile
         self.tmp = tempfile.TemporaryDirectory()
-        self.saved = (bastion.CACHE_FILE, bastion.STATE_FILE, bastion.download)
+        self.saved = (bastion.CACHE_FILE, bastion.STATE_FILE, bastion.download, bastion.COALESCE_SEC, bastion.FETCH_DEADLINE)
         bastion.CACHE_FILE = os.path.join(self.tmp.name, "c", "feeds.json")
         bastion.STATE_FILE = os.path.join(self.tmp.name, "s", "state.json")
-        self.feeds = {}  # kind -> bytes, or missing for "offline"
+        bastion.COALESCE_SEC = 0  # tests fetch back to back on purpose
+        self.feeds = {}    # kind -> bytes, or missing for "offline"
+        self.broken = set()  # URLs that fail even when the feed is up
+        self.slow = {}     # kind -> seconds to stall
+        self.calls = []    # (url, validators)
+        lock = threading.Lock()
 
-        def fake_download(url):
-            kind = next(k for k, u in bastion.FEEDS.items() if u == url)
-            if kind not in self.feeds:
+        def fake_download(url, validators=None):
+            with lock:
+                self.calls.append((url, dict(validators or {})))
+            kind = next(k for k, u in bastion.FEEDS.items() if url in (u, FILESTORE % k))
+            if kind in self.slow:
+                time.sleep(self.slow[kind])
+            if kind not in self.feeds or url in self.broken:
                 raise OSError("offline")
-            return self.feeds[kind]
+            data = self.feeds[kind]
+            etag = '"%08x"' % zlib.crc32(data)
+            if validators and validators.get("If-None-Match") == etag:
+                return None, {}
+            return data, {"url": FILESTORE % kind, "etag": etag, "lastModified": ""}
         bastion.download = fake_download
 
     def tearDown(self):
-        bastion.CACHE_FILE, bastion.STATE_FILE, bastion.download = self.saved
+        bastion.CACHE_FILE, bastion.STATE_FILE, bastion.download, bastion.COALESCE_SEC, bastion.FETCH_DEADLINE = self.saved
         self.tmp.cleanup()
 
     def fetch(self):
         return bastion.cmd_fetch()
 
+    def all_up(self):
+        self.feeds = {"psirt": rss("p1", "p2"), "outbreak": rss("o1"), "threat": rss("t1")}
+
     def test_offline_first_run_does_not_flood_later(self):
         self.assertEqual(self.fetch()["fresh"], [])                     # all three feeds down
-        self.feeds = {"psirt": rss("p1", "p2"), "outbreak": rss("o1"), "threat": rss("t1")}
+        self.all_up()
         result = self.fetch()
         self.assertEqual(result["fresh"], [])                            # backlog is baseline
         self.assertEqual(result["unreadTotal"], 0)
@@ -169,8 +213,134 @@ class StateTests(unittest.TestCase):
         self.assertEqual(unread, ["p3"])
         self.assertEqual(bastion.cmd_ack()["unreadTotal"], 0)
 
+    def test_ack_with_empty_list_acks_nothing(self):
+        self.feeds = {"psirt": rss("p1"), "outbreak": rss(), "threat": rss()}
+        self.fetch()
+        self.feeds["psirt"] = rss("p2", "p1")
+        self.fetch()
+        self.assertEqual(bastion.cmd_ack([])["unreadTotal"], 1)
+
+    def test_failed_fetch_keeps_old_time(self):
+        self.all_up()
+        first = self.fetch()["fetchedAt"]
+        self.assertGreater(first, 0)
+        self.feeds = {}
+        result = self.fetch()
+        self.assertEqual(result["fetchedAt"], first)                     # nothing answered: not "fresh"
+        self.assertEqual(sorted(result["errors"]), ["outbreak", "psirt", "threat"])
+        self.assertEqual([i["id"] for i in result["psirt"]], ["p1", "p2"])  # last copy still shown
+
+    def test_partial_failure_moves_time_forward(self):
+        self.all_up()
+        self.fetch()
+        del self.feeds["threat"]
+        result = self.fetch()
+        self.assertEqual(list(result["errors"]), ["threat"])
+        self.assertEqual([i["id"] for i in result["threat"]], ["t1"])
+
+    def test_unchanged_feed_costs_a_304(self):
+        self.all_up()
+        self.fetch()
+        self.calls.clear()
+        result = self.fetch()
+        self.assertEqual(result["errors"], {})
+        self.assertEqual([i["id"] for i in result["psirt"]], ["p1", "p2"])
+        # Straight to the learned host, with the stored validator.
+        for url, validators in self.calls:
+            self.assertTrue(url.startswith("https://filestore.fortinet.com/"), url)
+            self.assertIn("If-None-Match", validators)
+
+    def test_no_validators_without_cached_items(self):
+        self.all_up()
+        self.fetch()
+        with open(bastion.CACHE_FILE) as handle:
+            cache = json.load(handle)
+        cache["psirt"] = []
+        with open(bastion.CACHE_FILE, "w") as handle:
+            json.dump(cache, handle)
+        self.calls.clear()
+        result = self.fetch()
+        self.assertEqual([i["id"] for i in result["psirt"]], ["p1", "p2"])  # full download, not a 304 into nothing
+        psirt_calls = [v for u, v in self.calls if u in (bastion.FEEDS["psirt"], FILESTORE % "psirt")]
+        self.assertEqual(psirt_calls, [{}])
+
+    def test_old_cache_format_is_not_reused(self):
+        self.all_up()
+        self.fetch()
+        with open(bastion.CACHE_FILE) as handle:
+            cache = json.load(handle)
+        cache["format"] = 1
+        with open(bastion.CACHE_FILE, "w") as handle:
+            json.dump(cache, handle)
+        self.calls.clear()
+        self.fetch()
+        self.assertTrue(all(v == {} for _, v in self.calls))
+        self.assertTrue(all(u in bastion.FEEDS.values() for u, _ in self.calls))
+
+    def test_learned_url_falls_back_to_canonical(self):
+        self.all_up()
+        self.fetch()
+        self.broken = {FILESTORE % "psirt"}
+        self.feeds["psirt"] = rss("p3", "p1", "p2")
+        self.calls.clear()
+        result = self.fetch()
+        self.assertEqual(result["errors"], {})
+        self.assertEqual([i["id"] for i in result["psirt"]], ["p3", "p1", "p2"])
+        self.assertEqual([u for u, _ in self.calls if u in (bastion.FEEDS["psirt"], FILESTORE % "psirt")], [FILESTORE % "psirt", bastion.FEEDS["psirt"]])
+
+    def test_feeds_are_fetched_in_parallel_with_a_deadline(self):
+        self.all_up()
+        bastion.FETCH_DEADLINE = 0.5
+        self.slow = {"threat": 3}
+        started = time.monotonic()
+        result = self.fetch()
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(list(result["errors"]), ["threat"])
+        self.assertIn("TimeoutError", result["errors"]["threat"])
+        self.assertEqual([i["id"] for i in result["psirt"]], ["p1", "p2"])
+
+        self.slow = {"psirt": 0.3, "outbreak": 0.3, "threat": 0.3}
+        bastion.FETCH_DEADLINE = 5
+        started = time.monotonic()
+        self.assertEqual(self.fetch()["errors"], {})
+        self.assertLess(time.monotonic() - started, 0.8)   # three 0.3 s feeds at once, not 0.9 s in a row
+
+    def test_back_to_back_fetches_coalesce(self):
+        self.all_up()
+        self.fetch()
+        bastion.COALESCE_SEC = 60
+        self.feeds["outbreak"] = rss("o2", "o1")
+        self.calls.clear()
+        result = self.fetch()
+        self.assertEqual(self.calls, [])                    # reused: no network
+        self.assertEqual(result["fresh"], [])
+        self.assertEqual([i["id"] for i in result["outbreak"]], ["o1"])
+
+    def test_no_coalescing_after_errors(self):
+        self.feeds = {"psirt": rss("p1")}
+        self.fetch()
+        bastion.COALESCE_SEC = 60
+        self.all_up()
+        self.calls.clear()
+        self.assertEqual(self.fetch()["errors"], {})
+        self.assertNotEqual(self.calls, [])
+
+    def test_malformed_cached_items_are_skipped(self):
+        os.makedirs(os.path.dirname(bastion.CACHE_FILE))
+        with open(bastion.CACHE_FILE, "w") as handle:
+            json.dump({"fetchedAt": 1, "psirt": [{"title": "no id"}, 7, {"id": "p1", "title": "ok"}]}, handle)
+        self.assertEqual([i["id"] for i in bastion.cmd_cached()["psirt"]], ["p1"])
+        self.assertEqual([i["id"] for i in self.fetch()["psirt"]], ["p1"])  # feeds down: kept, minus junk
+
 
 class RedirectTests(unittest.TestCase):
+    CODES = (301, 302, 303, 307, 308)
+
+    def test_every_redirect_code_uses_the_override(self):
+        cls = bastion.FortinetOnlyRedirects
+        for code in self.CODES:
+            self.assertIs(getattr(cls, "http_error_%d" % code), cls.http_error_302, code)
+
     def test_off_site_redirect_refused(self):
         import urllib.error
         import urllib.request
@@ -183,13 +353,18 @@ class RedirectTests(unittest.TestCase):
         ok = handler.redirect_request(req, None, 302, "Found", {}, "https://filestore.fortinet.com/fortiguard/rss/ir.xml")
         self.assertEqual(ok.full_url, "https://filestore.fortinet.com/fortiguard/rss/ir.xml")
 
-    def _redirect_response(self, location, body_size):
-        """A real http.client response to a 302 whose body is body_size bytes,
-        served lazily; returns (response, function giving bytes consumed)."""
+    def _redirect_response(self, code, location, body_size):
+        """A real http.client response to a redirect whose body is body_size
+        bytes, served lazily; returns (response, function giving bytes consumed).
+        Draining the body past MAX_BYTES fails at once instead of crawling
+        through (and buffering) all of it."""
         import http.client
         import io
 
-        head = ("HTTP/1.1 302 Found\r\nLocation: %s\r\nContent-Length: %d\r\n\r\n" % (location, body_size)).encode()
+        lines = ["HTTP/1.1 %d Redirect" % code, "Content-Length: %d" % body_size]
+        if location is not None:
+            lines.append("Location: %s" % location)
+        head = ("\r\n".join(lines) + "\r\n\r\n").encode()
 
         class Body(io.RawIOBase):
             def __init__(self):
@@ -199,11 +374,11 @@ class RedirectTests(unittest.TestCase):
                 return True
 
             def readinto(self, buf):
-                total = len(head) + body_size
-                n = min(len(buf), total - self.pos)
-                for i in range(n):
-                    p = self.pos + i
-                    buf[i] = head[p] if p < len(head) else 0x41
+                if self.pos - len(head) > bastion.MAX_BYTES:
+                    raise AssertionError("redirect body is being drained")
+                n = min(len(buf), len(head) + body_size - self.pos, 64 * 1024)
+                part = head[self.pos:self.pos + n]
+                buf[:n] = part + b"A" * (n - len(part))
                 self.pos += n
                 return n
 
@@ -217,37 +392,54 @@ class RedirectTests(unittest.TestCase):
         resp.begin()
         return resp, lambda: raw.pos - len(head)
 
+    def _handle(self, code, target):
+        import urllib.request
+        handler = bastion.FortinetOnlyRedirects()
+        followed = []
+
+        class Parent:
+            def open(self, new, timeout=None):
+                followed.append(new.full_url)
+                return "followed"
+
+        handler.parent = Parent()
+        req = urllib.request.Request(bastion.FEEDS["psirt"])
+        req.timeout = bastion.TIMEOUT  # set by OpenerDirector.open in real use
+        resp, consumed = self._redirect_response(code, target, 64 * bastion.MAX_BYTES)
+        method = getattr(handler, "http_error_%d" % code)
+        return (lambda: method(req, resp, code, "Redirect", resp.msg)), resp, consumed, followed
+
     def test_redirect_body_is_not_buffered(self):
         import urllib.error
-        import urllib.request
-        big = 64 * bastion.MAX_BYTES
-        targets = (
-            ("https://filestore.fortinet.com/fortiguard/rss/ir.xml", None),
-            ("https://evil.example/ir.xml", urllib.error.HTTPError),
-        )
-        for target, raises in targets:
-            handler = bastion.FortinetOnlyRedirects()
-            followed = []
-
-            class Parent:
-                def open(self, new, timeout=None):
-                    followed.append(new.full_url)
-                    return "followed"
-
-            handler.parent = Parent()
-            req = urllib.request.Request(bastion.FEEDS["psirt"])
-            req.timeout = bastion.TIMEOUT  # set by OpenerDirector.open in real use
-            resp, consumed = self._redirect_response(target, big)
-            if raises:
-                with self.assertRaises(raises) as caught:
-                    handler.http_error_302(req, resp, 302, "Found", resp.msg)
-                caught.exception.close()
-                self.assertEqual(followed, [])
-            else:
-                self.assertEqual(handler.http_error_302(req, resp, 302, "Found", resp.msg), "followed")
-                self.assertEqual(followed, [target])
+        for code in self.CODES:
+            call, resp, consumed, followed = self._handle(code, "https://filestore.fortinet.com/fortiguard/rss/ir.xml")
+            self.assertEqual(call(), "followed", code)
+            self.assertEqual(followed, ["https://filestore.fortinet.com/fortiguard/rss/ir.xml"])
             # Only header parsing's buffered read-ahead may be consumed, never the body.
-            self.assertLess(consumed(), bastion.MAX_BYTES, target)
+            self.assertLess(consumed(), bastion.MAX_BYTES, code)
+            self.assertTrue(resp.isclosed())
+
+            call, resp, consumed, followed = self._handle(code, "https://evil.example/ir.xml")
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                call()
+            caught.exception.close()
+            self.assertEqual(followed, [])
+            self.assertLess(consumed(), bastion.MAX_BYTES, code)
+
+    def test_redirects_that_skip_redirect_request_are_closed_too(self):
+        import urllib.error
+        # A non-web Location: the stock handler raises before redirect_request.
+        call, resp, consumed, followed = self._handle(302, "data:text/plain,x")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            call()
+        caught.exception.close()
+        self.assertTrue(resp.isclosed())
+        self.assertLess(consumed(), bastion.MAX_BYTES)
+        # No Location at all: the stock handler returns None.
+        call, resp, consumed, followed = self._handle(302, None)
+        self.assertIsNone(call())
+        self.assertTrue(resp.isclosed())
+        self.assertLess(consumed(), bastion.MAX_BYTES)
 
 
 if __name__ == "__main__":
