@@ -89,6 +89,20 @@ class ParseTests(unittest.TestCase):
                      "https://www.fortinet.com:8443/x", "https://www.fortinet.com:0/x"):
             self.assertEqual(bastion.safe_link(link), "", link)
 
+    def test_clean_text_unclosed_tags_are_linear(self):
+        # A long run of "<" with no ">" made "<[^>]*>" rescan from every "<":
+        # quadratic (200k chars took ~11s, a 2 MiB title ~12 min) while holding
+        # the GIL, so fetch_all's join() deadline couldn't fire.
+        n = 200_000
+        for raw in ("<" * n, "&lt;" * n, "<a " * n, "<" * bastion.MAX_BYTES):
+            start = time.monotonic()
+            bastion.clean_text(raw, bastion.MAX_TITLE)
+            self.assertLess(time.monotonic() - start, 1.0)
+
+    def test_clean_text_still_strips_markup(self):
+        self.assertEqual(bastion.clean_text("<p>a <b>b</b></p> &lt;i&gt;c&lt;/i&gt;", 100), "a b c")
+        self.assertEqual(bastion.clean_text("x <<b>y", 100), "x < y")
+
 
 class VersionTests(unittest.TestCase):
     def test_user_agent_carries_manifest_version(self):

@@ -67,7 +67,10 @@ CVSS_RE = re.compile(r"CVSSv3\s*Score:\s*([0-9]{1,2}(?:\.[0-9])?)", re.I)
 # and FortiSwitch"). PSIRT titles don't name the product, so this is the only
 # place to learn what an advisory affects. FortiGuard is the source, not a product.
 PRODUCT_RE = re.compile(r"\bForti(?!Guard\b)[A-Z][A-Za-z0-9]{0,24}(?:-[A-Z0-9][A-Za-z0-9]{0,5})?\b")
-TAG_RE = re.compile(r"<[^>]*>")
+# "<" is excluded inside the tag so a failed match stops at the next "<":
+# with "<[^>]*>" a long run of unclosed "<" rescans the rest of the field from
+# every "<" (quadratic, and the regex holds the GIL so join() deadlines stall).
+TAG_RE = re.compile(r"<[^<>]*>")
 SPACE_RE = re.compile(r"\s+")
 CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f‪-‮⁦-⁩]")
 # ETag / Last-Modified values we store and send back: printable ASCII only.
@@ -339,10 +342,10 @@ def fetch_all(previous):
         except Exception as exc:  # noqa: BLE001 - reported per feed
             done[kind] = exc
 
+    deadline = time.monotonic() + FETCH_DEADLINE
     threads = [threading.Thread(target=work, args=(kind,), name="bastion-" + kind, daemon=True) for kind in FEEDS]
     for thread in threads:
         thread.start()
-    deadline = time.monotonic() + FETCH_DEADLINE
     for thread in threads:
         thread.join(max(0.0, deadline - time.monotonic()))
     return {kind: done.get(kind, TimeoutError("no answer within %ss" % FETCH_DEADLINE)) for kind in FEEDS}

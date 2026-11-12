@@ -336,6 +336,17 @@ Panel {
     }
   }
 
+  // Explicit paste for the lookup field (it is read-only, see there): at most
+  // 1 KiB, given up after 2 s, read in a separate process off the GUI thread.
+  Process {
+    id: pasteProc
+    command: ["sh", "-c", "timeout 2s wl-paste --no-newline --type text 2>/dev/null | head -c 1024"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (bastion.lookupField) bastion.lookupField.pasteText(text)
+    }
+  }
+
   // A helper run never needs this long (bastion.py gives up on the network
   // after 45 s); stop a stuck one so the jobs queued behind it can run.
   Timer {
@@ -586,6 +597,53 @@ Panel {
               placeholderText: strings.t("lookup.placeholder")
               foreground: bastion.foreground
               maximumLength: 256
+              // Read-only on purpose. A writable TextInput reads the whole
+              // clipboard on every clipboard change (QQuickTextInput::
+              // q_canPasteChanged -> mimeData()->text()), unbounded and on the
+              // shared shell's GUI thread, before any paste. So typing is
+              // handled here and Ctrl+V goes through pasteProc (byte cap and
+              // deadline, in a separate process).
+              readOnly: true
+              cursorDelegate: Rectangle {
+                width: 1
+                color: lookupField.color
+                visible: lookupField.activeFocus && blink.on
+                Timer {
+                  id: blink
+                  property bool on: true
+                  interval: 530
+                  repeat: true
+                  running: lookupField.activeFocus
+                  onRunningChanged: on = true
+                  onTriggered: on = !on
+                }
+              }
+              function replaceSelection(insert) {
+                var a = Math.min(selectionStart, selectionEnd), b = Math.max(selectionStart, selectionEnd)
+                if (a === b) { a = cursorPosition; b = cursorPosition }
+                insert = insert.slice(0, Math.max(0, maximumLength - (text.length - (b - a))))
+                text = text.slice(0, a) + insert + text.slice(b)
+                cursorPosition = a + insert.length
+              }
+              function pasteText(raw) {
+                replaceSelection(String(raw).split(/[\r\n]/)[0].replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g, "").trim())
+              }
+              Keys.onPressed: function(event) {
+                var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
+                var alt = (event.modifiers & (Qt.AltModifier | Qt.MetaModifier)) !== 0
+                var hasSel = selectionStart !== selectionEnd
+                if (ctrl && event.key === Qt.Key_V) { if (!pasteProc.running) pasteProc.running = true; event.accepted = true }
+                else if (ctrl && event.key === Qt.Key_X) { if (hasSel) { copy(); replaceSelection("") } event.accepted = true }
+                else if (event.key === Qt.Key_Backspace) {
+                  if (!hasSel && cursorPosition > 0) select(cursorPosition - 1, cursorPosition)
+                  replaceSelection(""); event.accepted = true
+                } else if (event.key === Qt.Key_Delete) {
+                  if (!hasSel && cursorPosition < text.length) select(cursorPosition, cursorPosition + 1)
+                  replaceSelection(""); event.accepted = true
+                } else if (!ctrl && !alt && event.text.length > 0 && !/[\x00-\x1f\x7f]/.test(event.text)) {
+                  replaceSelection(event.text); event.accepted = true
+                }
+              }
               Keys.onReturnPressed: bastion.lookup(text)
               Keys.onEnterPressed: bastion.lookup(text)
               Keys.onEscapePressed: {

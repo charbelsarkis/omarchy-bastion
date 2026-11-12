@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "charbel.bastion",
   "name": "Bastion",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "author": "charbel",
   "license": "MIT",
   "description": "FortiGuard Labs companion: Fortinet PSIRT advisories, Outbreak Alerts, Threat Signals and a FortiGuard lookup box in the Omarchy bar. Not affiliated with Fortinet.",
